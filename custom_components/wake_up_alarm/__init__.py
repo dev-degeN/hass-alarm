@@ -26,16 +26,27 @@ from homeassistant.util import dt as dt_util
 
 from custom_components.wake_up_alarm.alarm_manager import AlarmManager
 
+from .alarm_model import ALARM_TYPE_ONE_TIME, ALARM_TYPE_RECURRING, WEEKDAYS
 from .alarm_manager import async_remove_entry as am_async_remove_entry
 from .const import (
     ATTR_ALARM_DATETIME,
     ATTR_ALARM_NUMBER,
+    ATTR_ALARM_TYPE,
+    ATTR_ENABLED,
+    ATTR_NAME,
+    ATTR_TIME,
+    ATTR_WEEKDAYS,
     DOMAIN,
     LOGGER,
     SERVICE_ADD_ALARM,
+    SERVICE_ADD_RECURRING_ALARM,
+    SERVICE_DISABLE_ALARM,
     SERVICE_DELETE_ALARM,
     SERVICE_DELETE_ALARM_BY_NUMBER,
     SERVICE_DELETE_ALL_ALARMS,
+    SERVICE_ENABLE_ALARM,
+    SERVICE_SKIP_NEXT_ALARM,
+    SERVICE_UPDATE_ALARM,
     SIGNAL_ADD_ALARM,
     SIGNAL_DELETE_ALARM,
 )
@@ -70,9 +81,46 @@ DELETE_ALARM_BY_NUMBER_SERVICE_SCHEMA = vol.Schema(
 
 DELETE_ALL_ALARMS_SERVICE_SCHEMA = vol.Schema({})
 
+ALARM_NUMBER_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ALARM_NUMBER): cv.positive_int,
+    }
+)
+
 ADD_ALARM_SERVICE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_ALARM_DATETIME): cv.datetime,
+        vol.Optional(ATTR_NAME): cv.string,
+        vol.Optional(ATTR_ENABLED, default=True): cv.boolean,
+    }
+)
+
+ADD_RECURRING_ALARM_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_TIME): cv.string,
+        vol.Required(ATTR_WEEKDAYS): vol.All(
+            cv.ensure_list,
+            [vol.In(WEEKDAYS)],
+        ),
+        vol.Optional(ATTR_NAME): cv.string,
+        vol.Optional(ATTR_ENABLED, default=True): cv.boolean,
+    }
+)
+
+UPDATE_ALARM_SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ALARM_NUMBER): cv.positive_int,
+        vol.Optional(ATTR_NAME): cv.string,
+        vol.Optional(ATTR_ENABLED): cv.boolean,
+        vol.Optional(ATTR_ALARM_DATETIME): cv.datetime,
+        vol.Optional(ATTR_TIME): cv.string,
+        vol.Optional(ATTR_WEEKDAYS): vol.All(
+            cv.ensure_list,
+            [vol.In(WEEKDAYS)],
+        ),
+        vol.Optional(ATTR_ALARM_TYPE): vol.In(
+            [ALARM_TYPE_ONE_TIME, ALARM_TYPE_RECURRING],
+        ),
     }
 )
 
@@ -119,15 +167,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 try:
                     alarm_number_str = entity_entry.unique_id[len(prefix) :]
                     alarm_number = int(alarm_number_str)
-                    alarm_details = {ATTR_ALARM_NUMBER: alarm_number}
-                    delete_signal = f"{SIGNAL_DELETE_ALARM}_{config_entry_id}"
-                    await AlarmManager.execute_on_instance_async(
-                        hass,
-                        lambda am, an=alarm_number: (
-                            await am.delete_alarm(an) for _ in "_"
-                        ).__anext__(),
-                    )
-                    async_dispatcher_send(hass, delete_signal, alarm_details)
+                    am = AlarmManager.get_instance(hass)
+                    if am:
+                        await am.delete_alarm(alarm_number)
                 except ValueError:
                     LOGGER.warning(
                         "Could not parse alarm_number from unique_id %s for entity %s",
@@ -230,6 +272,8 @@ async def async_setup_entry(
 
         alarm_details = {
             ATTR_ALARM_DATETIME: utc_alarm_datetime_obj,
+            ATTR_NAME: service_call.data.get(ATTR_NAME),
+            ATTR_ENABLED: service_call.data[ATTR_ENABLED],
         }
 
         # Dispatch a signal specific to this config entry
@@ -245,6 +289,91 @@ async def async_setup_entry(
         SERVICE_ADD_ALARM,
         async_handle_add_alarm_service,
         schema=ADD_ALARM_SERVICE_SCHEMA,
+    )
+
+    async def async_handle_add_recurring_alarm_service(
+        service_call: ServiceCall,
+    ) -> None:
+        """Handle the service call to add a new recurring alarm."""
+        alarm_details = {
+            ATTR_ALARM_TYPE: ALARM_TYPE_RECURRING,
+            ATTR_TIME: service_call.data[ATTR_TIME],
+            ATTR_WEEKDAYS: service_call.data[ATTR_WEEKDAYS],
+            ATTR_NAME: service_call.data.get(ATTR_NAME),
+            ATTR_ENABLED: service_call.data[ATTR_ENABLED],
+        }
+
+        entry_specific_signal = f"{SIGNAL_ADD_ALARM}_{entry.entry_id}"
+        async_dispatcher_send(hass, entry_specific_signal, alarm_details)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ADD_RECURRING_ALARM,
+        async_handle_add_recurring_alarm_service,
+        schema=ADD_RECURRING_ALARM_SERVICE_SCHEMA,
+    )
+
+    async def async_handle_update_alarm_service(service_call: ServiceCall) -> None:
+        """Handle the service call to update an existing alarm."""
+        am = AlarmManager.get_instance(hass)
+        if not am:
+            LOGGER.warning("Cannot update alarm: No instance of %s found.", DOMAIN)
+            return
+        alarm_number = service_call.data[ATTR_ALARM_NUMBER]
+        changes = dict(service_call.data)
+        del changes[ATTR_ALARM_NUMBER]
+        await am.update_alarm(alarm_number, **changes)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_ALARM,
+        async_handle_update_alarm_service,
+        schema=UPDATE_ALARM_SERVICE_SCHEMA,
+    )
+
+    async def async_handle_enable_alarm_service(service_call: ServiceCall) -> None:
+        """Handle the service call to enable an alarm."""
+        am = AlarmManager.get_instance(hass)
+        if not am:
+            LOGGER.warning("Cannot enable alarm: No instance of %s found.", DOMAIN)
+            return
+        await am.enable_alarm(service_call.data[ATTR_ALARM_NUMBER])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ENABLE_ALARM,
+        async_handle_enable_alarm_service,
+        schema=ALARM_NUMBER_SERVICE_SCHEMA,
+    )
+
+    async def async_handle_disable_alarm_service(service_call: ServiceCall) -> None:
+        """Handle the service call to disable an alarm."""
+        am = AlarmManager.get_instance(hass)
+        if not am:
+            LOGGER.warning("Cannot disable alarm: No instance of %s found.", DOMAIN)
+            return
+        await am.disable_alarm(service_call.data[ATTR_ALARM_NUMBER])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DISABLE_ALARM,
+        async_handle_disable_alarm_service,
+        schema=ALARM_NUMBER_SERVICE_SCHEMA,
+    )
+
+    async def async_handle_skip_next_alarm_service(service_call: ServiceCall) -> None:
+        """Handle the service call to skip the next alarm occurrence."""
+        am = AlarmManager.get_instance(hass)
+        if not am:
+            LOGGER.warning("Cannot skip alarm: No instance of %s found.", DOMAIN)
+            return
+        await am.skip_next_alarm(service_call.data[ATTR_ALARM_NUMBER])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SKIP_NEXT_ALARM,
+        async_handle_skip_next_alarm_service,
+        schema=ALARM_NUMBER_SERVICE_SCHEMA,
     )
 
     async def async_handle_delete_all_alarms_service(service_call: ServiceCall) -> None:
@@ -269,6 +398,11 @@ async def async_setup_entry(
     # Ensure service is removed on unload
     def _unregister_services() -> None:
         hass.services.async_remove(DOMAIN, SERVICE_ADD_ALARM)
+        hass.services.async_remove(DOMAIN, SERVICE_ADD_RECURRING_ALARM)
+        hass.services.async_remove(DOMAIN, SERVICE_UPDATE_ALARM)
+        hass.services.async_remove(DOMAIN, SERVICE_ENABLE_ALARM)
+        hass.services.async_remove(DOMAIN, SERVICE_DISABLE_ALARM)
+        hass.services.async_remove(DOMAIN, SERVICE_SKIP_NEXT_ALARM)
         hass.services.async_remove(DOMAIN, SERVICE_DELETE_ALARM)
         hass.services.async_remove(DOMAIN, SERVICE_DELETE_ALARM_BY_NUMBER)
         hass.services.async_remove(DOMAIN, SERVICE_DELETE_ALL_ALARMS)
