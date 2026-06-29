@@ -80,8 +80,7 @@ class AllAlarmsSensor(WakeUpAlarmEntity, SensorEntity):
         next_alarm_entity = None
         if next_alarm:
             next_alarm_entity = (
-                f"sensor.wakeup_alarm_alarm_integration_alarm_"
-                f"{next_alarm['number']}"
+                f"sensor.wakeup_alarm_alarm_integration_alarm_{next_alarm['number']}"
             )
         return {
             "alarm_times": [
